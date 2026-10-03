@@ -1,0 +1,20 @@
+// История прослушиваний: изменяемая ячейка хранит список прослушанных треков.
+// На каждом шаге в давно созданную ячейку записывается новый, только что
+// созданный список (запись в уже опубликованный объект).
+// Результат --- длина истории, то есть n.
+language core;
+extend with #lists, #references, #sequencing, #let-bindings, #type-ascriptions,
+            #unit-type, #nat-recursion, #named-recursion;
+
+fn length(tracks : List[Nat]) -> Nat {
+  return match tracks {
+    List::nil => Nat::zero
+  | List::cons(track, rest) => Nat::succ(length(rest))
+  }
+}
+
+fn main(n : Nat) -> Nat {
+  return let history = Ref::new(List::nil as List[Nat]) in
+    Nat::rec(n, Unit::unit, |i, done| history := List::cons(i, !history));
+    length(!history)
+}

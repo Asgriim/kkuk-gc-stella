@@ -1,0 +1,12 @@
+// Удвоение числа: n шагов рекурсии по натуральному числу,
+// на каждом шаге к накопленному результату добавляется единица.
+language core;
+extend with #nat-recursion;
+
+fn double(n : Nat) -> Nat {
+  return Nat::rec(n, n, |i, acc| Nat::succ(acc))
+}
+
+fn main(n : Nat) -> Nat {
+  return double(n)
+}

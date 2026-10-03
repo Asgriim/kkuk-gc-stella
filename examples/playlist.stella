@@ -1,0 +1,25 @@
+// Плейлист из n треков: трек с номером i длится i + 1 минут.
+// Результат --- общая длительность плейлиста, n(n + 1)/2 минут.
+// Список и все его треки остаются достижимыми до конца подсчёта.
+language core;
+extend with #lists, #records, #type-ascriptions, #nat-recursion, #named-recursion;
+
+fn add(n : Nat) -> fn(Nat) -> Nat {
+  return fn(m : Nat) { return Nat::rec(n, m, |i, acc| Nat::succ(acc)) }
+}
+
+fn playlist(n : Nat) -> List[{id : Nat, minutes : Nat}] {
+  return Nat::rec(n, List::nil as List[{id : Nat, minutes : Nat}],
+    |i, tracks| List::cons({id = i, minutes = Nat::succ(i)}, tracks))
+}
+
+fn total(tracks : List[{id : Nat, minutes : Nat}]) -> Nat {
+  return match tracks {
+    List::nil => Nat::zero
+  | List::cons(track, rest) => add(track.minutes)(total(rest))
+  }
+}
+
+fn main(n : Nat) -> Nat {
+  return total(playlist(n))
+}

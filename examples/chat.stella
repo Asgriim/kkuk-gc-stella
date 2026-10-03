@@ -1,0 +1,22 @@
+// Чат: приходит n пачек сообщений, в пачке с номером i лежит i сообщений.
+// После подсчёта непрочитанных пачка больше не нужна и становится мусором.
+// Результат --- общее число сообщений, n(n - 1)/2.
+language core;
+extend with #lists, #type-ascriptions, #nat-recursion, #named-recursion;
+
+fn batch(size : Nat) -> List[Nat] {
+  return Nat::rec(size, List::nil as List[Nat], |i, messages| List::cons(i, messages))
+}
+
+fn count(messages : List[Nat]) -> fn(Nat) -> Nat {
+  return fn(seen : Nat) {
+    return match messages {
+      List::nil => seen
+    | List::cons(message, rest) => count(rest)(Nat::succ(seen))
+    }
+  }
+}
+
+fn main(n : Nat) -> Nat {
+  return Nat::rec(n, Nat::zero, |i, seen| count(batch(i))(seen))
+}
