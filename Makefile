@@ -1,6 +1,7 @@
 CC = cc
 CXX = c++
 AR = ar
+CLANG_FORMAT ?= clang-format
 
 CPPFLAGS ?=
 CFLAGS ?= -O2 -g -Wall -Wextra -Wpedantic
@@ -15,11 +16,18 @@ EXAMPLE_OBJECTS := $(addprefix build/examples/,$(addsuffix .o,$(EXAMPLES)))
 GC_OBJECT := build/gc.o
 GC_LIBRARY := build/libstella_gc.a
 OBJECTS := $(RUNTIME_OBJECTS) $(EXAMPLE_OBJECTS) $(GC_OBJECT)
+FORMAT_SOURCES := gc.cpp $(wildcard internal/*.h internal/*.hpp)
 
-.PHONY: all clean
+.PHONY: all clean format format-check
 .SECONDARY: $(OBJECTS)
 
 all: $(PROGRAMS)
+
+format:
+	$(CLANG_FORMAT) -i $(FORMAT_SOURCES)
+
+format-check:
+	$(CLANG_FORMAT) --dry-run --Werror $(FORMAT_SOURCES)
 
 $(PROGRAMS): build/%: build/examples/%.o $(RUNTIME_OBJECTS) $(GC_LIBRARY)
 	$(CXX) $(LDFLAGS) $^ $(LDLIBS) -o $@
