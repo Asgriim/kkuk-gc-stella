@@ -10,8 +10,14 @@ typedef struct StellaGcStats {
     size_t allocated_objects;
 
     size_t collections;
+    size_t minor_collections;
+    size_t full_collections;
     size_t occupied_bytes;
     size_t maximum_occupied_bytes;
+    size_t young_occupied_bytes;
+    size_t maximum_young_occupied_bytes;
+    size_t old_occupied_bytes;
+    size_t maximum_old_occupied_bytes;
 
     size_t managed_reads;
     size_t managed_writes;
