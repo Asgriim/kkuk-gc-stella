@@ -1,0 +1,13 @@
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*,
+  -modernize-use-trailing-return-type
+HeaderFilterRegex: '(^|/)internal/.*'
+CheckOptions:
+  readability-identifier-naming.MethodCase: camelBack
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.MemberSuffix: '_'

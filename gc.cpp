@@ -1,86 +1,168 @@
 #include "internal/stella_abi.hpp"
+#include "internal/gc_stats.hpp"
 
-#include "internal/gc_stats.h"
+#include <algorithm>
+#include <charconv>
+#include <cinttypes>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <new>
+#include <span>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+#include <vector>
 
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
+namespace {
 
 struct Space {
-    unsigned char *start;
-    size_t used;
+    Space() = default;
+
+    explicit Space(std::size_t bytes)
+
+        : storage_(std::make_unique_for_overwrite<std::byte[]>(bytes)), capacity_(bytes) {
+    }
+
+    [[nodiscard]] std::byte *data() const noexcept {
+        return storage_.get();
+    }
+
+    void clear() noexcept {
+        used_ = 0;
+        occupied_ = 0;
+    }
+
+    bool contains(StellaValue object) const noexcept {
+        auto address = reinterpret_cast<std::uintptr_t>(object);
+        auto start = reinterpret_cast<std::uintptr_t>(data());
+
+        return address >= start && address - start < used_;
+    }
+
+  private:
+    std::unique_ptr<std::byte[]> storage_;
+
+  public:
+    std::size_t capacity_{};
+    std::size_t used_{};
+    std::size_t occupied_{};
 };
 
-enum Lifecycle {
-    LIFECYCLE_FRESH,
-    LIFECYCLE_ACTIVE,
-    LIFECYCLE_FINISHED
+class Collector {
+  public:
+    void init(const StellaGcConfig *config);
+    void shutdown();
+    void pushRoot(StellaValue *root);
+    void popRoot(StellaValue *root);
+    void registerPermanentRoot(StellaValue *root);
+    StellaValue alloc(const StellaObjectDescriptor *descriptor);
+    void initManaged(StellaValue object, std::size_t index, StellaValue value);
+    void initPrimitive(StellaValue object, std::size_t index, StellaPrimitive value);
+    StellaValue readManaged(StellaValue *object_root, std::size_t index);
+    void writeManaged(StellaValue *object_root, std::size_t index, StellaValue *value_root);
+    StellaPrimitive readPrimitive(StellaValue object, std::size_t index);
+    void writePrimitive(StellaValue object, std::size_t index, StellaPrimitive value);
+    void updateObject(StellaValue *object_root,
+        const StellaObjectDescriptor *new_descriptor,
+        StellaValue *const *new_managed_roots,
+        const StellaPrimitive *new_primitives);
+    void printStatistics(FILE *output) const;
+    void printRoots(FILE *output) const;
+    void printState(FILE *output) const;
+
+  private:
+    enum class Lifecycle : std::uint8_t {
+        Fresh,
+        Active,
+        Finished
+    };
+    enum class CollectionKind : std::uint8_t {
+        Young,
+        Full
+    };
+
+    Lifecycle lifecycle_{Lifecycle::Fresh};
+    std::size_t max_heap_bytes_{};
+
+    Space young_space_;
+    Space old_space_;
+    Space reserve_space_;
+
+    static constexpr std::uintptr_t remembered_mark_ = 1;
+    std::vector<StellaValue> remembered_;
+
+    std::vector<StellaValue *> dynamic_roots_;
+    std::vector<StellaValue *> permanent_roots_;
+    GcStats counters_;
+
+    void requireActive() const;
+    static std::size_t objectSize(const StellaObjectDescriptor *descriptor);
+    static std::size_t roundedSize(std::size_t size);
+    static void validateDescriptor(const StellaObjectDescriptor *descriptor);
+    bool inHeap(StellaValue object) const;
+    void requireHeapObject(StellaValue object) const;
+    void validateObject(StellaValue object) const;
+    bool rememberObject(StellaValue object);
+    void writeBarrier(StellaValue object, StellaValue value);
+    StellaValue forward(StellaValue object, Space &destination, CollectionKind kind);
+    void forwardRoots(Space &destination, CollectionKind kind);
+    void forwardFields(StellaValue object, Space &destination, CollectionKind kind);
+    void scanCopies(Space &destination, std::size_t scan, CollectionKind kind);
+    void collectFull();
+    void collectYoung();
+    void refreshOccupancy();
+    [[nodiscard]] bool allocationFits(
+        const Space &space, std::size_t requested, std::size_t rounded) const;
+    bool rootIsRegistered(StellaValue *root) const;
+    void requireRegisteredRoot(StellaValue *root) const;
+    [[nodiscard]] std::size_t youngCapacityFromEnvironment() const;
+    static void printSpace(FILE *output, const char *name, const Space &space);
 };
 
-static enum Lifecycle lifecycle = LIFECYCLE_FRESH;
-static size_t max_heap_bytes;
-
-static Space from_space;
-static Space to_space;
-
-static StellaValue **dynamic_roots;
-static size_t dynamic_root_depth;
-static size_t dynamic_root_capacity;
-
-static StellaValue **permanent_roots;
-static size_t permanent_root_count;
-static size_t permanent_root_capacity;
-
-static StellaGcStats counters;
-
-static void require_active(void) {
-    if (lifecycle != LIFECYCLE_ACTIVE) {
+void Collector::requireActive() const {
+    if (lifecycle_ != Lifecycle::Active) {
         stella_abi_violation("collector operation outside its active lifetime");
     }
 }
 
-static bool add_overflows(size_t left, size_t right) {
-    return left > SIZE_MAX - right;
-}
+std::size_t Collector::objectSize(const StellaObjectDescriptor *descriptor) {
 
-static bool multiply_overflows(size_t left, size_t right) {
-    return right != 0 && left > SIZE_MAX / right;
-}
+    constexpr auto max_slots =
+        (std::numeric_limits<std::size_t>::max() - sizeof(StellaObject)) / sizeof(StellaSlot);
 
-static size_t object_size(const StellaObjectDescriptor *descriptor) {
-    if (multiply_overflows(descriptor->slot_capacity, sizeof(StellaSlot))) {
-        stella_abi_violation("object slot capacity overflows size_t");
-    }
-
-    size_t slots = descriptor->slot_capacity * sizeof(StellaSlot);
-
-    if (add_overflows(sizeof(StellaObject), slots)) {
+    if (descriptor->slot_capacity > max_slots) {
         stella_abi_violation("object size overflows size_t");
     }
+
+    std::size_t slots = descriptor->slot_capacity * sizeof(StellaSlot);
 
     return sizeof(StellaObject) + slots;
 }
 
-static size_t rounded_size(size_t size) {
-    size_t alignment = alignof(StellaObject);
-    size_t remainder = size % alignment;
+std::size_t Collector::roundedSize(std::size_t size) {
+    std::size_t alignment = alignof(StellaObject);
+    std::size_t remainder = size % alignment;
 
     if (remainder == 0) {
         return size;
     }
 
-    size_t padding = alignment - remainder;
+    std::size_t padding = alignment - remainder;
 
-    if (add_overflows(size, padding)) {
+    if (size > std::numeric_limits<std::size_t>::max() - padding) {
         stella_abi_violation("aligned object size overflows size_t");
     }
 
     return size + padding;
 }
 
-static void validate_descriptor(const StellaObjectDescriptor *descriptor) {
-    if (descriptor == NULL) {
+void Collector::validateDescriptor(const StellaObjectDescriptor *descriptor) {
+    if (descriptor == nullptr) {
         stella_abi_violation("null object descriptor");
     }
 
@@ -92,7 +174,7 @@ static void validate_descriptor(const StellaObjectDescriptor *descriptor) {
         stella_abi_violation("unknown object kind");
     }
 
-    uint32_t known_flags = STELLA_DESCRIPTOR_STATIC | STELLA_DESCRIPTOR_UPDATABLE;
+    std::uint32_t known_flags = STELLA_DESCRIPTOR_STATIC | STELLA_DESCRIPTOR_UPDATABLE;
 
     if ((descriptor->flags & ~known_flags) != 0) {
         stella_abi_violation("unknown descriptor flag");
@@ -103,21 +185,18 @@ static void validate_descriptor(const StellaObjectDescriptor *descriptor) {
         stella_abi_violation("static descriptor is marked updatable");
     }
 
-    if (add_overflows(descriptor->managed_count, descriptor->primitive_count)) {
-        stella_abi_violation("active field count overflows size_t");
-    }
-
-    if (descriptor->managed_count + descriptor->primitive_count > descriptor->slot_capacity) {
+    if (descriptor->managed_count > descriptor->slot_capacity ||
+        descriptor->primitive_count > descriptor->slot_capacity - descriptor->managed_count) {
         stella_abi_violation("active fields exceed slot capacity");
     }
 
     if ((descriptor->kind == STELLA_OBJECT_CLOSURE || descriptor->kind == STELLA_OBJECT_THUNK) &&
-        descriptor->entry_code == NULL) {
+        descriptor->entry_code == nullptr) {
         stella_abi_violation("executable descriptor has no entry code");
     }
 
     if ((descriptor->kind == STELLA_OBJECT_DATA || descriptor->kind == STELLA_OBJECT_INDIRECTION) &&
-        descriptor->entry_code != NULL) {
+        descriptor->entry_code != nullptr) {
         stella_abi_violation("non-executable descriptor has entry code");
     }
 
@@ -131,164 +210,229 @@ static void validate_descriptor(const StellaObjectDescriptor *descriptor) {
     }
 }
 
-static bool in_from_space(StellaValue object) {
-    uintptr_t address = reinterpret_cast<uintptr_t>(object);
-    uintptr_t start = reinterpret_cast<uintptr_t>(from_space.start);
-
-    return address >= start && address - start < from_space.used;
+bool Collector::inHeap(StellaValue object) const {
+    return young_space_.contains(object) || old_space_.contains(object);
 }
 
-static void require_heap_object(StellaValue object) {
-    if (object == NULL) {
+void Collector::requireHeapObject(StellaValue object) const {
+    if (object == nullptr) {
         stella_abi_violation("null object");
     }
 
-    if (!in_from_space(object)) {
+    if (!inHeap(object)) {
         stella_abi_violation("object is not owned by the collector");
     }
 
-    validate_descriptor(object->descriptor);
+    validateDescriptor(object->descriptor);
 }
 
-static void validate_object(StellaValue object) {
-    if (object == NULL) {
+void Collector::validateObject(StellaValue object) const {
+    if (object == nullptr) {
         stella_abi_violation("null object");
     }
 
-    validate_descriptor(object->descriptor);
+    validateDescriptor(object->descriptor);
 
-    if ((object->descriptor->flags & STELLA_DESCRIPTOR_STATIC) == 0 && !in_from_space(object)) {
+    if ((object->descriptor->flags & STELLA_DESCRIPTOR_STATIC) == 0 && !inHeap(object)) {
         stella_abi_violation("object is not owned by the collector");
     }
 }
 
-static StellaValue forward(StellaValue object) {
-    if (object == NULL || (object->descriptor->flags & STELLA_DESCRIPTOR_STATIC) != 0) {
+bool Collector::rememberObject(StellaValue object) {
+    if (object->gc_word == remembered_mark_) {
+        return false;
+    }
+
+    remembered_.push_back(object);
+    object->gc_word = remembered_mark_;
+
+    return true;
+}
+
+void Collector::writeBarrier(StellaValue object, StellaValue value) {
+
+    if (old_space_.contains(object) && young_space_.contains(value) && rememberObject(object)) {
+        ++counters_.write_barrier_activations_;
+    }
+}
+
+StellaValue Collector::forward(StellaValue object, Space &destination, CollectionKind kind) {
+    if (object == nullptr || (object->descriptor->flags & STELLA_DESCRIPTOR_STATIC) != 0) {
         return object;
     }
 
-    require_heap_object(object);
+    requireHeapObject(object);
 
-    if (object->gc_word != 0) {
+    if (kind == CollectionKind::Young && old_space_.contains(object)) {
+        return object;
+    }
+
+    if (object->gc_word > remembered_mark_) {
+
         return reinterpret_cast<StellaValue>(object->gc_word);
     }
 
     const StellaObjectDescriptor *descriptor = object->descriptor;
-    size_t requested = object_size(descriptor);
-    size_t rounded = rounded_size(requested);
+    std::size_t requested = objectSize(descriptor);
+    std::size_t rounded = roundedSize(requested);
 
-    if (rounded > max_heap_bytes - to_space.used) {
-        stella_abi_violation("copying exceeds semispace capacity");
+    if (rounded > destination.capacity_ - destination.used_) {
+        stella_abi_violation("copying exceeds destination capacity");
     }
 
-    StellaValue copy =
-        static_cast<StellaValue>(memcpy(to_space.start + to_space.used, object, requested));
+    auto *copy = static_cast<StellaValue>(
+        std::memcpy(destination.data() + destination.used_, object, requested));
 
-    copy->fields = descriptor->slot_capacity == 0 ? NULL : reinterpret_cast<StellaSlot *>(copy + 1);
-
+    copy->fields =
+        descriptor->slot_capacity == 0 ? nullptr : reinterpret_cast<StellaSlot *>(copy + 1);
     copy->gc_word = 0;
 
-    size_t active = descriptor->managed_count + descriptor->primitive_count;
+    std::size_t active = descriptor->managed_count + descriptor->primitive_count;
 
-    for (size_t i = active; i < descriptor->slot_capacity; ++i) {
+    for (std::size_t i = active; i < descriptor->slot_capacity; ++i) {
         copy->fields[i].primitive = 0;
     }
 
-    to_space.used += rounded;
+    destination.used_ += rounded;
+    destination.occupied_ += requested;
 
-    object->gc_word = reinterpret_cast<uintptr_t>(copy);
+    object->gc_word = reinterpret_cast<std::uintptr_t>(copy);
 
     return copy;
 }
 
-static void collect(void) {
-    to_space.used = 0;
-
-    for (size_t i = 0; i < dynamic_root_depth; ++i) {
-        *dynamic_roots[i] = forward(*dynamic_roots[i]);
+void Collector::forwardRoots(Space &destination, CollectionKind kind) {
+    for (auto *root : dynamic_roots_) {
+        *root = forward(*root, destination, kind);
     }
 
-    for (size_t i = 0; i < permanent_root_count; ++i) {
-        *permanent_roots[i] = forward(*permanent_roots[i]);
+    for (auto *root : permanent_roots_) {
+        *root = forward(*root, destination, kind);
     }
-
-    size_t scan = 0;
-    size_t live_bytes = 0;
-
-    while (scan < to_space.used) {
-        StellaValue object = reinterpret_cast<StellaValue>(to_space.start + scan);
-
-        for (size_t i = 0; i < object->descriptor->managed_count; ++i) {
-            object->fields[i].managed = forward(object->fields[i].managed);
-        }
-
-        size_t requested = object_size(object->descriptor);
-        live_bytes += requested;
-        scan += rounded_size(requested);
-    }
-
-    Space old_space = from_space;
-    from_space = to_space;
-    to_space = old_space;
-    to_space.used = 0;
-
-    counters.occupied_bytes = live_bytes;
-    ++counters.collections;
 }
 
-static bool root_is_registered(StellaValue *root) {
-    for (size_t i = 0; i < dynamic_root_depth; ++i) {
-        if (dynamic_roots[i] == root) {
-            return true;
-        }
-    }
+void Collector::forwardFields(StellaValue object, Space &destination, CollectionKind kind) {
 
-    for (size_t i = 0; i < permanent_root_count; ++i) {
-        if (permanent_roots[i] == root) {
-            return true;
-        }
+    for (auto &field : std::span{object->fields, object->descriptor->managed_count}) {
+        field.managed = forward(field.managed, destination, kind);
     }
-
-    return false;
 }
 
-static void require_registered_root(StellaValue *root) {
-    if (root == NULL || !root_is_registered(root)) {
+void Collector::scanCopies(Space &destination, std::size_t scan, CollectionKind kind) {
+
+    while (scan < destination.used_) {
+        auto *object = reinterpret_cast<StellaValue>(destination.data() + scan);
+        forwardFields(object, destination, kind);
+        scan += roundedSize(objectSize(object->descriptor));
+    }
+}
+
+void Collector::collectFull() {
+    reserve_space_.clear();
+
+    forwardRoots(reserve_space_, CollectionKind::Full);
+    scanCopies(reserve_space_, 0, CollectionKind::Full);
+
+    std::swap(old_space_, reserve_space_);
+    reserve_space_.clear();
+    young_space_.clear();
+
+    remembered_.clear();
+    ++counters_.collections_;
+    ++counters_.full_collections_;
+}
+
+void Collector::collectYoung() {
+    if (young_space_.used_ == 0) {
+        return;
+    }
+
+    if (young_space_.used_ > old_space_.capacity_ - old_space_.used_) {
+        collectFull();
+        return;
+    }
+
+    std::size_t scan = old_space_.used_;
+    forwardRoots(old_space_, CollectionKind::Young);
+
+    for (auto *object : remembered_) {
+        forwardFields(object, old_space_, CollectionKind::Young);
+        object->gc_word = 0;
+    }
+
+    scanCopies(old_space_, scan, CollectionKind::Young);
+    young_space_.clear();
+    remembered_.clear();
+    ++counters_.collections_;
+    ++counters_.minor_collections_;
+}
+
+void Collector::refreshOccupancy() {
+    counters_.young_occupied_bytes_ = young_space_.occupied_;
+    counters_.old_occupied_bytes_ = old_space_.occupied_;
+    counters_.occupied_bytes_ = young_space_.occupied_ + old_space_.occupied_;
+
+    counters_.maximum_occupied_bytes_ =
+        std::max(counters_.maximum_occupied_bytes_, counters_.occupied_bytes_);
+    counters_.maximum_young_occupied_bytes_ =
+        std::max(counters_.maximum_young_occupied_bytes_, young_space_.occupied_);
+    counters_.maximum_old_occupied_bytes_ =
+        std::max(counters_.maximum_old_occupied_bytes_, old_space_.occupied_);
+}
+
+bool Collector::allocationFits(
+    const Space &space, std::size_t requested, std::size_t rounded) const {
+    std::size_t occupied = young_space_.occupied_ + old_space_.occupied_;
+    std::size_t used = young_space_.used_ + old_space_.used_;
+
+    return requested <= max_heap_bytes_ - occupied && rounded <= max_heap_bytes_ - used &&
+           rounded <= space.capacity_ - space.used_;
+}
+
+bool Collector::rootIsRegistered(StellaValue *root) const {
+    return std::ranges::find(dynamic_roots_, root) != dynamic_roots_.end() ||
+           std::ranges::find(permanent_roots_, root) != permanent_roots_.end();
+}
+
+void Collector::requireRegisteredRoot(StellaValue *root) const {
+    if (root == nullptr || !rootIsRegistered(root)) {
         stella_abi_violation("field access uses an unregistered root");
     }
 }
 
-static void grow_roots(StellaValue ***roots, size_t *capacity, size_t required) {
-    if (required <= *capacity) {
-        return;
+std::size_t Collector::youngCapacityFromEnvironment() const {
+    const char *value = std::getenv("STELLA_GC_YOUNG_BYTES");
+
+    if (value == nullptr) {
+        return max_heap_bytes_ / 4 == 0 ? 1 : max_heap_bytes_ / 4;
     }
 
-    if (*capacity > SIZE_MAX / 2) {
-        stella_abi_violation("root stack capacity overflows size_t");
+    std::string_view text{value};
+
+    if (text.empty()) {
+        stella_abi_violation("STELLA_GC_YOUNG_BYTES must be between 1 and max_heap_bytes");
     }
 
-    size_t next = *capacity == 0 ? 8 : *capacity * 2;
+    std::size_t bytes = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), bytes);
 
-    if (next < required || multiply_overflows(next, sizeof(**roots))) {
-        stella_abi_violation("root stack capacity overflows size_t");
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        stella_abi_violation("STELLA_GC_YOUNG_BYTES must be a positive decimal byte count");
     }
 
-    void *storage = realloc(*roots, next * sizeof(**roots));
-
-    if (storage == NULL) {
-        stella_abi_violation("root stack exhaustion");
+    if (bytes == 0 || bytes > max_heap_bytes_) {
+        stella_abi_violation("STELLA_GC_YOUNG_BYTES must be between 1 and max_heap_bytes");
     }
 
-    *roots = static_cast<StellaValue **>(storage);
-    *capacity = next;
+    return bytes;
 }
 
-void stella_gc_init(const StellaGcConfig *config) {
-    if (lifecycle != LIFECYCLE_FRESH) {
+void Collector::init(const StellaGcConfig *config) {
+    if (lifecycle_ != Lifecycle::Fresh) {
         stella_abi_violation("collector initialised more than once");
     }
 
-    if (config == NULL) {
+    if (config == nullptr) {
         stella_abi_violation("null collector configuration");
     }
 
@@ -300,145 +444,155 @@ void stella_gc_init(const StellaGcConfig *config) {
         stella_abi_violation("zero maximum heap size");
     }
 
-    max_heap_bytes = config->max_heap_bytes;
+    max_heap_bytes_ = config->max_heap_bytes;
 
-    from_space.start = static_cast<unsigned char *>(malloc(max_heap_bytes));
-    to_space.start = static_cast<unsigned char *>(malloc(max_heap_bytes));
+    try {
+        Space young{youngCapacityFromEnvironment()};
+        Space old{max_heap_bytes_};
+        Space reserve{max_heap_bytes_};
 
-    if (from_space.start == NULL || to_space.start == NULL) {
-        free(from_space.start);
-        free(to_space.start);
-        stella_gc_out_of_memory(max_heap_bytes);
+        young_space_ = std::move(young);
+        old_space_ = std::move(old);
+        reserve_space_ = std::move(reserve);
+    } catch (const std::bad_alloc &) {
+        stella_gc_out_of_memory(max_heap_bytes_);
     }
 
-    lifecycle = LIFECYCLE_ACTIVE;
+    lifecycle_ = Lifecycle::Active;
 }
 
-void stella_gc_shutdown(void) {
-    require_active();
+void Collector::shutdown() {
+    requireActive();
 
-    if (dynamic_root_depth != 0) {
+    if (!dynamic_roots_.empty()) {
         stella_abi_violation("runtime shutdown with dynamic roots registered");
     }
 
-    free(from_space.start);
-    free(to_space.start);
-    from_space = {};
-    to_space = {};
+    young_space_ = {};
+    old_space_ = {};
+    reserve_space_ = {};
 
-    free(dynamic_roots);
-    free(permanent_roots);
-    dynamic_roots = NULL;
-    permanent_roots = NULL;
-    dynamic_root_capacity = 0;
-    permanent_root_capacity = 0;
-    counters.occupied_bytes = 0;
-    lifecycle = LIFECYCLE_FINISHED;
+    remembered_ = std::vector<StellaValue>{};
+    dynamic_roots_ = std::vector<StellaValue *>{};
+    permanent_roots_ = std::vector<StellaValue *>{};
+
+    counters_.occupied_bytes_ = 0;
+    counters_.young_occupied_bytes_ = 0;
+    counters_.old_occupied_bytes_ = 0;
+    lifecycle_ = Lifecycle::Finished;
 }
 
-void stella_gc_push_root(StellaValue *root) {
-    require_active();
+void Collector::pushRoot(StellaValue *root) {
+    requireActive();
 
-    if (root == NULL) {
+    if (root == nullptr) {
         stella_abi_violation("null root slot");
     }
 
-    if (root_is_registered(root)) {
+    if (rootIsRegistered(root)) {
         stella_abi_violation("duplicate root registration");
     }
 
-    grow_roots(&dynamic_roots, &dynamic_root_capacity, dynamic_root_depth + 1);
-    dynamic_roots[dynamic_root_depth++] = root;
-    counters.dynamic_root_depth = dynamic_root_depth;
+    dynamic_roots_.push_back(root);
+    counters_.dynamic_root_depth_ = dynamic_roots_.size();
 
-    if (dynamic_root_depth > counters.maximum_dynamic_root_depth) {
-        counters.maximum_dynamic_root_depth = dynamic_root_depth;
-    }
+    counters_.maximum_dynamic_root_depth_ =
+        std::max(counters_.maximum_dynamic_root_depth_, dynamic_roots_.size());
 }
 
-void stella_gc_pop_root(StellaValue *root) {
-    require_active();
+void Collector::popRoot(StellaValue *root) {
+    requireActive();
 
-    if (dynamic_root_depth == 0) {
+    if (dynamic_roots_.empty()) {
         stella_abi_violation("dynamic root stack underflow");
     }
 
-    if (dynamic_roots[dynamic_root_depth - 1] != root) {
+    if (dynamic_roots_.back() != root) {
         stella_abi_violation("dynamic roots popped out of order");
     }
 
-    --dynamic_root_depth;
-    counters.dynamic_root_depth = dynamic_root_depth;
+    dynamic_roots_.pop_back();
+    counters_.dynamic_root_depth_ = dynamic_roots_.size();
 }
 
-void stella_gc_register_permanent_root(StellaValue *root) {
-    require_active();
+void Collector::registerPermanentRoot(StellaValue *root) {
+    requireActive();
 
-    if (root == NULL) {
+    if (root == nullptr) {
         stella_abi_violation("null permanent-root slot");
     }
 
-    if (root_is_registered(root)) {
+    if (rootIsRegistered(root)) {
         stella_abi_violation("duplicate root registration");
     }
 
-    grow_roots(&permanent_roots, &permanent_root_capacity, permanent_root_count + 1);
-    permanent_roots[permanent_root_count++] = root;
-    counters.permanent_root_count = permanent_root_count;
+    permanent_roots_.push_back(root);
+    counters_.permanent_root_count_ = permanent_roots_.size();
 }
 
-StellaValue stella_gc_alloc(const StellaObjectDescriptor *descriptor) {
-    require_active();
-    validate_descriptor(descriptor);
+StellaValue Collector::alloc(const StellaObjectDescriptor *descriptor) {
+    requireActive();
+    validateDescriptor(descriptor);
 
     if ((descriptor->flags & STELLA_DESCRIPTOR_STATIC) != 0) {
         stella_abi_violation("heap allocation requested with static descriptor");
     }
 
-    size_t requested = object_size(descriptor);
-    size_t rounded = rounded_size(requested);
+    std::size_t requested = objectSize(descriptor);
+    std::size_t rounded = roundedSize(requested);
 
-    if (requested > max_heap_bytes - counters.occupied_bytes ||
-        rounded > max_heap_bytes - from_space.used) {
-        collect();
+    bool large = rounded > young_space_.capacity_;
+
+    if (!large && rounded > young_space_.capacity_ - young_space_.used_) {
+        collectYoung();
     }
 
-    if (requested > max_heap_bytes - counters.occupied_bytes ||
-        rounded > max_heap_bytes - from_space.used) {
-        ++counters.failed_allocations;
+    Space &destination = large ? old_space_ : young_space_;
+
+    if (!allocationFits(destination, requested, rounded)) {
+        collectFull();
+    }
+
+    if (!allocationFits(destination, requested, rounded)) {
+        ++counters_.failed_allocations_;
         stella_gc_out_of_memory(requested);
     }
 
-    StellaValue object = reinterpret_cast<StellaValue>(from_space.start + from_space.used);
-    object->descriptor = descriptor;
-    object->gc_word = 0;
-    object->fields = descriptor->slot_capacity == 0 ? NULL : (StellaSlot *)(object + 1);
+    auto *object = reinterpret_cast<StellaValue>(destination.data() + destination.used_);
+    std::construct_at(object,
+        StellaObject{
+            .descriptor = descriptor,
+            .gc_word = 0,
+            .fields = descriptor->slot_capacity == 0 ? nullptr
+                                                     : reinterpret_cast<StellaSlot *>(object + 1),
+        });
 
-    for (size_t i = 0; i < descriptor->managed_count; ++i) {
-        object->fields[i].managed = NULL;
+    for (std::size_t i = 0; i < descriptor->managed_count; ++i) {
+        object->fields[i].managed = nullptr;
     }
 
-    for (size_t i = descriptor->managed_count; i < descriptor->slot_capacity; ++i) {
+    for (std::size_t i = descriptor->managed_count; i < descriptor->slot_capacity; ++i) {
         object->fields[i].primitive = 0;
     }
 
-    from_space.used += rounded;
+    destination.used_ += rounded;
+    destination.occupied_ += requested;
 
-    counters.requested_bytes += requested;
-    counters.rounded_bytes += rounded;
-    ++counters.allocated_objects;
-    counters.occupied_bytes += requested;
-
-    if (counters.occupied_bytes > counters.maximum_occupied_bytes) {
-        counters.maximum_occupied_bytes = counters.occupied_bytes;
+    if (large && descriptor->managed_count != 0) {
+        rememberObject(object);
     }
+
+    counters_.requested_bytes_ += requested;
+    counters_.rounded_bytes_ += rounded;
+    ++counters_.allocated_objects_;
+    refreshOccupancy();
 
     return object;
 }
 
-void stella_object_init_managed(StellaValue object, size_t index, StellaValue value) {
-    require_active();
-    require_heap_object(object);
+void Collector::initManaged(StellaValue object, std::size_t index, StellaValue value) {
+    requireActive();
+    requireHeapObject(object);
 
     if (index >= object->descriptor->managed_count) {
         stella_abi_violation("managed initialisation index out of range");
@@ -447,37 +601,37 @@ void stella_object_init_managed(StellaValue object, size_t index, StellaValue va
     object->fields[index].managed = value;
 }
 
-void stella_object_init_primitive(StellaValue object, size_t index, StellaPrimitive value) {
-    require_active();
-    require_heap_object(object);
+void Collector::initPrimitive(StellaValue object, std::size_t index, StellaPrimitive value) {
+    requireActive();
+    requireHeapObject(object);
 
     if (index >= object->descriptor->primitive_count) {
         stella_abi_violation("primitive initialisation index out of range");
     }
 
-    size_t physical = object->descriptor->managed_count + index;
+    std::size_t physical = object->descriptor->managed_count + index;
     object->fields[physical].primitive = value;
 }
 
-StellaValue stella_gc_read_managed(StellaValue *object_root, size_t index) {
-    require_active();
-    require_registered_root(object_root);
-    validate_object(*object_root);
+StellaValue Collector::readManaged(StellaValue *object_root, std::size_t index) {
+    requireActive();
+    requireRegisteredRoot(object_root);
+    validateObject(*object_root);
 
     if (index >= (*object_root)->descriptor->managed_count) {
         stella_abi_violation("managed read index out of range");
     }
 
-    ++counters.managed_reads;
+    ++counters_.managed_reads_;
 
     return (*object_root)->fields[index].managed;
 }
 
-void stella_gc_write_managed(StellaValue *object_root, size_t index, StellaValue *value_root) {
-    require_active();
-    require_registered_root(object_root);
-    require_registered_root(value_root);
-    validate_object(*object_root);
+void Collector::writeManaged(StellaValue *object_root, std::size_t index, StellaValue *value_root) {
+    requireActive();
+    requireRegisteredRoot(object_root);
+    requireRegisteredRoot(value_root);
+    validateObject(*object_root);
 
     if (((*object_root)->descriptor->flags & STELLA_DESCRIPTOR_STATIC) != 0) {
         stella_abi_violation("managed write to static object");
@@ -487,26 +641,27 @@ void stella_gc_write_managed(StellaValue *object_root, size_t index, StellaValue
         stella_abi_violation("managed write index out of range");
     }
 
+    writeBarrier(*object_root, *value_root);
     (*object_root)->fields[index].managed = *value_root;
-    ++counters.managed_writes;
+    ++counters_.managed_writes_;
 }
 
-StellaPrimitive stella_object_read_primitive(StellaValue object, size_t index) {
-    require_active();
-    validate_object(object);
+StellaPrimitive Collector::readPrimitive(StellaValue object, std::size_t index) {
+    requireActive();
+    validateObject(object);
 
     if (index >= object->descriptor->primitive_count) {
         stella_abi_violation("primitive read index out of range");
     }
 
-    ++counters.primitive_reads;
+    ++counters_.primitive_reads_;
 
     return object->fields[object->descriptor->managed_count + index].primitive;
 }
 
-void stella_object_write_primitive(StellaValue object, size_t index, StellaPrimitive value) {
-    require_active();
-    validate_object(object);
+void Collector::writePrimitive(StellaValue object, std::size_t index, StellaPrimitive value) {
+    requireActive();
+    validateObject(object);
 
     if ((object->descriptor->flags & STELLA_DESCRIPTOR_STATIC) != 0) {
         stella_abi_violation("primitive write to static object");
@@ -517,18 +672,18 @@ void stella_object_write_primitive(StellaValue object, size_t index, StellaPrimi
     }
 
     object->fields[object->descriptor->managed_count + index].primitive = value;
-    ++counters.primitive_writes;
+    ++counters_.primitive_writes_;
 }
 
-void stella_gc_update_object(StellaValue *object_root,
+void Collector::updateObject(StellaValue *object_root,
     const StellaObjectDescriptor *new_descriptor,
-    StellaValue *const new_managed_roots[],
-    const StellaPrimitive new_primitives[]) {
-    require_active();
-    require_registered_root(object_root);
-    require_heap_object(*object_root);
+    StellaValue *const *new_managed_roots,
+    const StellaPrimitive *new_primitives) {
+    requireActive();
+    requireRegisteredRoot(object_root);
+    requireHeapObject(*object_root);
     const StellaObjectDescriptor *old_descriptor = (*object_root)->descriptor;
-    validate_descriptor(new_descriptor);
+    validateDescriptor(new_descriptor);
 
     if ((old_descriptor->flags & STELLA_DESCRIPTOR_UPDATABLE) == 0 ||
         (new_descriptor->flags & STELLA_DESCRIPTOR_STATIC) != 0) {
@@ -539,152 +694,267 @@ void stella_gc_update_object(StellaValue *object_root,
         stella_abi_violation("object-layout update changes slot capacity");
     }
 
-    if (new_descriptor->managed_count != 0 && new_managed_roots == NULL) {
+    if (new_descriptor->managed_count != 0 && new_managed_roots == nullptr) {
         stella_abi_violation("missing managed values for object-layout update");
     }
 
-    if (new_descriptor->primitive_count != 0 && new_primitives == NULL) {
+    if (new_descriptor->primitive_count != 0 && new_primitives == nullptr) {
         stella_abi_violation("missing primitive values for object-layout update");
     }
 
-    for (size_t i = 0; i < new_descriptor->managed_count; ++i) {
-        require_registered_root(new_managed_roots[i]);
+    for (std::size_t i = 0; i < new_descriptor->managed_count; ++i) {
+        requireRegisteredRoot(new_managed_roots[i]);
     }
 
-    for (size_t i = 0; i < new_descriptor->managed_count; ++i) {
+    for (std::size_t i = 0; i < new_descriptor->managed_count; ++i) {
+        writeBarrier(*object_root, *new_managed_roots[i]);
         (*object_root)->fields[i].managed = *new_managed_roots[i];
-        ++counters.managed_writes;
+        ++counters_.managed_writes_;
     }
 
-    for (size_t i = 0; i < new_descriptor->primitive_count; ++i) {
-        size_t physical = new_descriptor->managed_count + i;
+    for (std::size_t i = 0; i < new_descriptor->primitive_count; ++i) {
+        std::size_t physical = new_descriptor->managed_count + i;
         (*object_root)->fields[physical].primitive = new_primitives[i];
-        ++counters.primitive_writes;
+        ++counters_.primitive_writes_;
     }
 
-    size_t active = new_descriptor->managed_count + new_descriptor->primitive_count;
+    std::size_t active = new_descriptor->managed_count + new_descriptor->primitive_count;
 
-    for (size_t i = active; i < new_descriptor->slot_capacity; ++i) {
+    for (std::size_t i = active; i < new_descriptor->slot_capacity; ++i) {
         (*object_root)->fields[i].primitive = 0;
     }
 
     (*object_root)->descriptor = new_descriptor;
 }
 
-void stella_gc_print_statistics(FILE *output) {
-    require_active();
+void Collector::printStatistics(FILE *output) const {
+    requireActive();
 
-    if (output == NULL) {
+    if (output == nullptr) {
         stella_abi_violation("null statistics output stream");
     }
 
-    fprintf(output, "requested bytes: %zu\n", counters.requested_bytes);
-    fprintf(output, "rounded bytes: %zu\n", counters.rounded_bytes);
-    fprintf(output, "allocated objects: %zu\n", counters.allocated_objects);
+    std::fprintf(output, "requested bytes: %zu\n", counters_.requested_bytes_);
+    std::fprintf(output, "rounded bytes: %zu\n", counters_.rounded_bytes_);
+    std::fprintf(output, "allocated objects: %zu\n", counters_.allocated_objects_);
 
-    fprintf(output, "collections: %zu\n", counters.collections);
-    fprintf(output, "occupied bytes: %zu\n", counters.occupied_bytes);
-    fprintf(output, "maximum occupied bytes: %zu\n", counters.maximum_occupied_bytes);
+    std::fprintf(output, "collections: %zu\n", counters_.collections_);
+    std::fprintf(output, "minor collections: %zu\n", counters_.minor_collections_);
+    std::fprintf(output, "full collections: %zu\n", counters_.full_collections_);
+    std::fprintf(output, "occupied bytes: %zu\n", counters_.occupied_bytes_);
+    std::fprintf(output, "maximum occupied bytes: %zu\n", counters_.maximum_occupied_bytes_);
+    std::fprintf(output, "young occupied bytes: %zu\n", counters_.young_occupied_bytes_);
+    std::fprintf(
+        output, "maximum young occupied bytes: %zu\n", counters_.maximum_young_occupied_bytes_);
+    std::fprintf(output, "old occupied bytes: %zu\n", counters_.old_occupied_bytes_);
+    std::fprintf(
+        output, "maximum old occupied bytes: %zu\n", counters_.maximum_old_occupied_bytes_);
 
-    fprintf(output, "managed reads: %zu\n", counters.managed_reads);
-    fprintf(output, "managed writes: %zu\n", counters.managed_writes);
-    fprintf(output, "primitive reads: %zu\n", counters.primitive_reads);
-    fprintf(output, "primitive writes: %zu\n", counters.primitive_writes);
+    std::fprintf(output, "managed reads: %zu\n", counters_.managed_reads_);
+    std::fprintf(output, "managed writes: %zu\n", counters_.managed_writes_);
+    std::fprintf(output, "primitive reads: %zu\n", counters_.primitive_reads_);
+    std::fprintf(output, "primitive writes: %zu\n", counters_.primitive_writes_);
 
-    fprintf(output, "read barrier activations: %zu\n", counters.read_barrier_activations);
-    fprintf(output, "write barrier activations: %zu\n", counters.write_barrier_activations);
+    std::fprintf(output, "read barrier activations: %zu\n", counters_.read_barrier_activations_);
+    std::fprintf(output, "write barrier activations: %zu\n", counters_.write_barrier_activations_);
 
-    fprintf(output, "dynamic roots: %zu\n", dynamic_root_depth);
-    fprintf(output, "maximum dynamic roots: %zu\n", counters.maximum_dynamic_root_depth);
-    fprintf(output, "permanent roots: %zu\n", permanent_root_count);
+    std::fprintf(output, "dynamic roots: %zu\n", dynamic_roots_.size());
+    std::fprintf(output, "maximum dynamic roots: %zu\n", counters_.maximum_dynamic_root_depth_);
+    std::fprintf(output, "permanent roots: %zu\n", permanent_roots_.size());
 
-    fprintf(output, "failed allocations: %zu\n", counters.failed_allocations);
+    std::fprintf(output, "failed allocations: %zu\n", counters_.failed_allocations_);
 }
 
-void stella_gc_print_roots(FILE *output) {
-    require_active();
+void Collector::printRoots(FILE *output) const {
+    requireActive();
 
-    if (output == NULL) {
+    if (output == nullptr) {
         stella_abi_violation("null roots output stream");
     }
 
-    for (size_t i = 0; i < dynamic_root_depth; ++i) {
-        fprintf(output,
+    for (std::size_t i = 0; i < dynamic_roots_.size(); ++i) {
+        std::fprintf(output,
             "dynamic root %zu: slot=%p value=%p\n",
             i,
-            (void *)dynamic_roots[i],
-            (void *)*dynamic_roots[i]);
+            static_cast<void *>(dynamic_roots_[i]),
+            static_cast<void *>(*dynamic_roots_[i]));
     }
 
-    for (size_t i = 0; i < permanent_root_count; ++i) {
-        fprintf(output,
+    for (std::size_t i = 0; i < permanent_roots_.size(); ++i) {
+        std::fprintf(output,
             "permanent root %zu: slot=%p value=%p\n",
             i,
-            (void *)permanent_roots[i],
-            (void *)*permanent_roots[i]);
+            static_cast<void *>(permanent_roots_[i]),
+            static_cast<void *>(*permanent_roots_[i]));
     }
 }
 
-void stella_gc_print_state(FILE *output) {
-    require_active();
+void Collector::printSpace(FILE *output, const char *name, const Space &space) {
+    std::fprintf(output,
+        "%s=[%p,%p) capacity=%zu used=%zu occupied=%zu free=%zu next=%p limit=%p\n",
+        name,
+        static_cast<void *>(space.data()),
+        static_cast<void *>(space.data() + space.capacity_),
+        space.capacity_,
+        space.used_,
+        space.occupied_,
+        space.capacity_ - space.used_,
+        static_cast<void *>(space.data() + space.used_),
+        static_cast<void *>(space.data() + space.capacity_));
 
-    if (output == NULL) {
-        stella_abi_violation("null state output stream");
-    }
-
-    fprintf(output,
-        "%s: occupied=%zu free=%zu limit=%zu\n",
-        "Cheney",
-        counters.occupied_bytes,
-        max_heap_bytes - counters.occupied_bytes,
-        max_heap_bytes);
-
-    fprintf(output,
-        "active=[%p,%p) capacity=%zu used=%zu free=%zu next=%p\n",
-        (void *)from_space.start,
-        (void *)(from_space.start + max_heap_bytes),
-        max_heap_bytes,
-        from_space.used,
-        max_heap_bytes - from_space.used,
-        (void *)(from_space.start + from_space.used));
-
-    fprintf(output,
-        "reserve=[%p,%p) capacity=%zu used=0 free=%zu\n",
-        (void *)to_space.start,
-        (void *)(to_space.start + max_heap_bytes),
-        max_heap_bytes,
-        max_heap_bytes);
-
-    for (size_t offset = 0; offset < from_space.used;) {
-        StellaValue object = reinterpret_cast<StellaValue>(from_space.start + offset);
+    for (std::size_t offset = 0; offset < space.used_;) {
+        auto *object = reinterpret_cast<StellaValue>(space.data() + offset);
         const StellaObjectDescriptor *descriptor = object->descriptor;
-        size_t rounded = rounded_size(object_size(descriptor));
-        fprintf(output,
+        std::size_t rounded = roundedSize(objectSize(descriptor));
+        std::fprintf(output,
             "allocation=[%p,%p) object=%p descriptor=%s kind=%" PRIu32
             " managed=%zu primitive=%zu capacity=%zu gc_word=%" PRIuPTR "\n",
-            (void *)object,
-            (void *)((unsigned char *)object + rounded),
-            (void *)object,
-            descriptor->debug_name == NULL ? "(unnamed)" : descriptor->debug_name,
+            static_cast<void *>(object),
+            static_cast<void *>(reinterpret_cast<std::byte *>(object) + rounded),
+            static_cast<void *>(object),
+            descriptor->debug_name == nullptr ? "(unnamed)" : descriptor->debug_name,
             descriptor->kind,
             descriptor->managed_count,
             descriptor->primitive_count,
             descriptor->slot_capacity,
             object->gc_word);
 
-        for (size_t i = 0; i < descriptor->managed_count; ++i) {
-            fprintf(output, "  managed[%zu]=%p\n", i, (void *)object->fields[i].managed);
+        for (std::size_t i = 0; i < descriptor->managed_count; ++i) {
+            std::fprintf(
+                output, "  managed[%zu]=%p\n", i, static_cast<void *>(object->fields[i].managed));
         }
 
-        for (size_t i = 0; i < descriptor->primitive_count; ++i) {
-            fprintf(output,
+        for (std::size_t i = 0; i < descriptor->primitive_count; ++i) {
+            std::fprintf(output,
                 "  primitive[%zu]=%" PRIuPTR "\n",
                 i,
                 object->fields[descriptor->managed_count + i].primitive);
         }
 
+        std::size_t active = descriptor->managed_count + descriptor->primitive_count;
+
+        for (std::size_t i = active; i < descriptor->slot_capacity; ++i) {
+            std::fprintf(output, "  inactive[%zu]=%" PRIuPTR "\n", i, object->fields[i].primitive);
+        }
+
         offset += rounded;
     }
+}
 
-    stella_gc_print_roots(output);
+void Collector::printState(FILE *output) const {
+    requireActive();
+
+    if (output == nullptr) {
+        stella_abi_violation("null state output stream");
+    }
+
+    std::fprintf(output,
+        "generational Cheney: occupied=%zu free=%zu limit=%zu promotion_age=1\n",
+        counters_.occupied_bytes_,
+        max_heap_bytes_ - counters_.occupied_bytes_,
+        max_heap_bytes_);
+
+    std::fprintf(output, "collection=idle scan=inactive\n");
+
+    printSpace(output, "young", young_space_);
+    printSpace(output, "old", old_space_);
+    printSpace(output, "reserve", reserve_space_);
+    std::fprintf(output, "remembered objects: %zu\n", remembered_.size());
+
+    for (std::size_t i = 0; i < remembered_.size(); ++i) {
+        std::fprintf(output, "  remembered[%zu]=%p\n", i, static_cast<void *>(remembered_[i]));
+    }
+
+    printRoots(output);
+}
+
+Collector &collector() {
+    static Collector instance;
+    return instance;
+}
+
+template <typename Action> decltype(auto) callAbi(Action &&action) noexcept {
+    try {
+        return std::forward<Action>(action)();
+    } catch (const std::bad_alloc &) {
+        stella_abi_violation("collector metadata allocation failed");
+    } catch (const std::length_error &) {
+        stella_abi_violation("collector metadata capacity exceeded");
+    } catch (...) {
+        stella_abi_violation("unexpected C++ exception in collector");
+    }
+}
+
+}
+
+extern "C" {
+
+void stella_gc_init(const StellaGcConfig *config) {
+    callAbi([&] { collector().init(config); });
+}
+
+void stella_gc_shutdown() {
+    callAbi([&] { collector().shutdown(); });
+}
+
+void stella_gc_push_root(StellaValue *root) {
+    callAbi([&] { collector().pushRoot(root); });
+}
+
+void stella_gc_pop_root(StellaValue *root) {
+    callAbi([&] { collector().popRoot(root); });
+}
+
+void stella_gc_register_permanent_root(StellaValue *root) {
+    callAbi([&] { collector().registerPermanentRoot(root); });
+}
+
+StellaValue stella_gc_alloc(const StellaObjectDescriptor *descriptor) {
+    return callAbi([&] { return collector().alloc(descriptor); });
+}
+
+void stella_object_init_managed(StellaValue object, std::size_t index, StellaValue value) {
+    callAbi([&] { collector().initManaged(object, index, value); });
+}
+
+void stella_object_init_primitive(StellaValue object, std::size_t index, StellaPrimitive value) {
+    callAbi([&] { collector().initPrimitive(object, index, value); });
+}
+
+StellaValue stella_gc_read_managed(StellaValue *object_root, std::size_t index) {
+    return callAbi([&] { return collector().readManaged(object_root, index); });
+}
+
+void stella_gc_write_managed(StellaValue *object_root, std::size_t index, StellaValue *value_root) {
+    callAbi([&] { collector().writeManaged(object_root, index, value_root); });
+}
+
+StellaPrimitive stella_object_read_primitive(StellaValue object, std::size_t index) {
+    return callAbi([&] { return collector().readPrimitive(object, index); });
+}
+
+void stella_object_write_primitive(StellaValue object, std::size_t index, StellaPrimitive value) {
+    callAbi([&] { collector().writePrimitive(object, index, value); });
+}
+
+void stella_gc_update_object(StellaValue *object_root,
+    const StellaObjectDescriptor *new_descriptor,
+    StellaValue *const new_managed_roots[],
+    const StellaPrimitive new_primitives[]) {
+    callAbi([&] {
+        collector().updateObject(object_root, new_descriptor, new_managed_roots, new_primitives);
+    });
+}
+
+void stella_gc_print_statistics(FILE *output) {
+    callAbi([&] { collector().printStatistics(output); });
+}
+
+void stella_gc_print_roots(FILE *output) {
+    callAbi([&] { collector().printRoots(output); });
+}
+
+void stella_gc_print_state(FILE *output) {
+    callAbi([&] { collector().printState(output); });
+}
 }
