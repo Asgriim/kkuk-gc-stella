@@ -3,7 +3,6 @@
 #include <cstddef>
 
 struct GcStats {
-
     std::size_t requested_bytes_{};
     std::size_t rounded_bytes_{};
     std::size_t allocated_objects_{};
@@ -11,6 +10,7 @@ struct GcStats {
     std::size_t collections_{};
     std::size_t minor_collections_{};
     std::size_t full_collections_{};
+
     std::size_t occupied_bytes_{};
     std::size_t maximum_occupied_bytes_{};
     std::size_t young_occupied_bytes_{};

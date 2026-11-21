@@ -1,0 +1,7 @@
+{
+  "program": "replaced_payload",
+  "argument": "0",
+  "heap": 2048,
+  "young": 1,
+  "stdout": "0\n"
+}

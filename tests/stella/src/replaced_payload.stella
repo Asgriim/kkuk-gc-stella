@@ -1,0 +1,8 @@
+language core;
+
+fn main(n : Nat) -> Nat {
+  return let cell = Ref::new(Nat::zero) in
+    Nat::rec(n, Unit::unit, |i, done|
+      cell := Nat::succ(Nat::succ(Nat::succ(Nat::zero))));
+    !cell
+}

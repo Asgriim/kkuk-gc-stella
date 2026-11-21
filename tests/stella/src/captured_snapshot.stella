@@ -1,0 +1,11 @@
+language core;
+
+fn remember(n : Nat) -> fn(Nat) -> Nat {
+  return fn(ignored : Nat) { return n }
+}
+
+fn main(n : Nat) -> Nat {
+  return let snapshot = remember(Nat::succ(n)) in
+    let ignored = Nat::rec(n, Nat::zero, |i, saved| Nat::succ(Nat::succ(Nat::zero))) in
+    snapshot(ignored)
+}

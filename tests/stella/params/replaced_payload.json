@@ -1,0 +1,11 @@
+{
+  "program": "replaced_payload",
+  "argument": "48",
+  "heap": 4096,
+  "young": 128,
+  "stdout": "3\n",
+  "minimum_statistics": {
+    "minor collections": 1,
+    "write barrier activations": 1
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "program": "retained_chain",
+  "argument": "28",
+  "heap": 1536,
+  "young": 128,
+  "stdout": "",
+  "error": "cannot allocate"
+}

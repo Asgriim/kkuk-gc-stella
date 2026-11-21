@@ -4,7 +4,6 @@
 #include <stddef.h>
 
 typedef struct StellaGcStats {
-
     size_t requested_bytes;
     size_t rounded_bytes;
     size_t allocated_objects;
@@ -12,6 +11,7 @@ typedef struct StellaGcStats {
     size_t collections;
     size_t minor_collections;
     size_t full_collections;
+
     size_t occupied_bytes;
     size_t maximum_occupied_bytes;
     size_t young_occupied_bytes;

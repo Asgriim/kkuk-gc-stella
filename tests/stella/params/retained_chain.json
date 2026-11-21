@@ -1,0 +1,10 @@
+{
+  "program": "retained_chain",
+  "argument": "28",
+  "heap": 4096,
+  "young": 128,
+  "stdout": "56\n",
+  "minimum_statistics": {
+    "collections": 1
+  }
+}

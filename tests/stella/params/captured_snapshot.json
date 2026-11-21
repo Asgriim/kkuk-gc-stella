@@ -1,0 +1,10 @@
+{
+  "program": "captured_snapshot",
+  "argument": "40",
+  "heap": 4096,
+  "young": 96,
+  "stdout": "41\n",
+  "minimum_statistics": {
+    "collections": 1
+  }
+}
